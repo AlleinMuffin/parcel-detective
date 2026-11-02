@@ -1,0 +1,31 @@
+# parcel_detective v2.0.0 运行依赖
+#
+# v2.0.0 定位: 纯 VLM 兜底系统 (放弃条码识别与传统 OCR)
+# 因此**不含** zxing-cpp / paddlepaddle / paddleocr / paddlex / modelscope。
+#
+# 安装:
+#     conda create -n parcel_detective python=3.11
+#     conda activate parcel_detective
+#     pip install -r requirements.txt
+#
+# 另需在本机安装 Ollama 并拉取模型 (不在 pip 里):
+#     ollama pull qwen3-vl:2b-instruct
+#     服务地址默认 http://localhost:11434
+#     模型存储建议设 OLLAMA_MODELS 到非系统盘
+
+# ---- 图形界面 ----
+PyQt5>=5.15
+
+# ---- 图像处理 ----
+opencv-python>=4.8
+numpy>=1.24
+
+# ---- VLM 客户端 ----
+ollama>=0.4
+
+# ---- 模糊匹配 (matcher 用; 缺失时会自动退回纯 difflib, 只是慢一些) ----
+fuzzywuzzy>=0.18
+python-Levenshtein>=0.21
+
+# ---- 打包 (仅构建 exe 时需要) ----
+# pyinstaller>=6.0
