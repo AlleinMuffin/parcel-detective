@@ -6,3 +6,4 @@ _backup/
 *.7z
 .venv/
 .env
+.vscode/

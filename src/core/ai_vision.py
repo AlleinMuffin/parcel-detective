@@ -112,6 +112,20 @@ def _default_model() -> str:
     return (os.environ.get(MODEL_ENV_VAR) or "").strip() or MODEL_NAME
 
 
+#: 上下文长度可用环境变量覆盖 —— 换回"会思考"的模型时才需要调大。
+NUM_CTX_ENV_VAR = "PARCEL_AI_NUM_CTX"
+
+
+def _default_num_ctx() -> int:
+    """取默认上下文长度: 环境变量 ``PARCEL_AI_NUM_CTX`` 优先, 否则 8192."""
+    raw = (os.environ.get(NUM_CTX_ENV_VAR) or "").strip()
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return 8192
+    return val if val >= 2048 else 8192
+
+
 def cache_dir() -> Path:
     """AI 模块自己的缓存目录 (在系统临时目录下).
 
@@ -239,20 +253,18 @@ class VisionConfig:
     temperature: float = 0.0
     #: 是否用 JSON Schema 约束输出。True 时若服务端不支持会自动退回 "json"。
     use_schema: bool = True
-    #: **上下文长度** —— 真实面单上的最关键参数。
+    #: **上下文长度** —— 直接决定显存占用与推理是否落在 GPU 上。
     #:
-    #: ⚠️ 实测教训: Ollama 默认上下文偏小, 而 qwen3-vl 在**复杂真实面单**上
-    #: 会写出 3000~31000 字的思考内容。上下文一满, 模型就**来不及输出 JSON**,
-    #: 返回的 content 是空字符串, 表现为"模型没有返回任何内容"。
+    #: 历史: 早期用 qwen3-vl:2b (会思考) 时, 思考内容能写到 3000~31000 字,
+    #: 上下文给小了会""来不及输出 JSON""; 当时把默认值定到 32768。
     #:
-    #: 真实面单横评 (5 张, 同样加 /no_think)::
+    #: ⚠️ v2.1.1 实测: 现在的默认模型是 **2b-instruct (不思考)**, 32768 完全没必要,
+    #: 而且会把模型撑到 9.8 GB —— 8 GB 显存装不下, Ollama 只能 41%/59% CPU/GPU
+    #: 混跑, 单张 58~137 秒。改成 8192 后显存 2.6 GB、**100% GPU**, 单张 2~3 秒。
     #:
-    #:     ctx=16384  成功 3/5   均耗时 67.8s   均思考 13408 字
-    #:     ctx=32768  成功 4/5   均耗时 52.1s   均思考  3822 字
-    #:
-    #: 上下文给足后, 模型能**把思考正常写完**再输出 JSON; 给不够时它会在
-    #: 截断处反复纠缠, 思考越写越长却永远轮不到输出。因此默认给 32768。
-    num_ctx: int = 32768
+    #: 真实面单的提示词约 2300 token + 输出约 250 token, 8192 有充足余量;
+    #: 只有换回"会思考"的模型时才需要调大 (可用 PARCEL_AI_NUM_CTX 覆盖)。
+    num_ctx: int = field(default_factory=_default_num_ctx)
     #: 是否在提示词前加 Qwen3 的 ``/no_think`` 控制标记。
     #:
     #: 需求第 3 条要求"关闭思考模式", 并说明"可以在 prompt 中明确要求,
@@ -263,7 +275,20 @@ class VisionConfig:
     no_think: bool = True
     #: 单次尝试的超时 (秒)。超时就换更省资源的配置重试,
     #: 避免一张特别难的图把整批拖到几分钟。
-    attempt_timeout: float = 90.0
+    attempt_timeout: float = 25.0
+    #: 单张**总预算**（秒）。超过就不再尝试下一档，直接返回最后一次的错误。
+    #:
+    #: 正常 2~4 秒；病态图（模型反复输出 1024 token 的垃圾）在 3 档重试下
+    #: 能烧掉 30 秒以上。设总预算后，最坏情况也有上限。
+    total_budget_s: float = 20.0
+    #: 模型在显存里的保留时间（Ollama ``keep_alive``）。
+    #:
+    #: 默认 ``5m`` 时，两次识别间隔一长就要重新加载模型（GPU 上约 7 秒）。
+    #: 调到 30 分钟，连续核件时模型常驻，单张只剩推理时间。
+    keep_alive: str = "30m"
+    #: 单次输出 token 上限。面单 15 字段的 JSON 约 250 token，
+    #: 给 1024 足够；设 0 表示不限制（Ollama 默认）。
+    max_output_tokens: int = 1024
     #: **放行模式**, 透传给 matcher。取值 ``"lenient"`` / ``"normal"`` / ``"strict"``:
     #:
     #: ``lenient`` 宽松
@@ -296,7 +321,10 @@ class VisionConfig:
                 "timeout": self.timeout, "max_image_side": self.max_image_side,
                 "use_schema": self.use_schema, "retries": self.retries,
                 "num_ctx": self.num_ctx, "no_think": self.no_think,
-                "attempt_timeout": self.attempt_timeout}
+                "attempt_timeout": self.attempt_timeout,
+                "total_budget_s": self.total_budget_s,
+                "keep_alive": self.keep_alive,
+                "max_output_tokens": self.max_output_tokens}
 
 
 DEFAULT_CONFIG = VisionConfig()
@@ -594,15 +622,20 @@ def _build_prompt(cfg: VisionConfig) -> str:
 
 def _call_once(client: Any, cfg: VisionConfig, image_arg: Any,
                fmt: Any, *, num_ctx: Optional[int] = None
-               ) -> Tuple[Any, str, int]:
-    """发起一次调用并解析; 返回 ``(解析结果, 错误说明, thinking 字数)``.
+               ) -> Tuple[Any, str, int, str]:
+    """发起一次调用并解析; 返回 ``(解析结果, 错误说明, thinking 字数, 结束原因)``.
 
     ``thinking`` 字数会一并返回 —— 排查"content 为空"时它就是最有用的线索
     (空 content + 上千字 thinking = 上下文被思考吃光了)。
+    ``finish`` 是 Ollama 的 ``done_reason``: ``stop`` 正常结束, ``length``
+    表示撞上 ``num_predict`` 上限。后者说明模型在打转, 同图重试不会变好。
     """
     opts: Dict[str, Any] = {"temperature": cfg.temperature}
     if num_ctx:
         opts["num_ctx"] = int(num_ctx)
+    if int(cfg.max_output_tokens or 0) > 0:
+        # 不设上限时模型偶尔会继续"自言自语", 生成时间不可控
+        opts["num_predict"] = int(cfg.max_output_tokens)
     opts.update(cfg.extra_options)
 
     resp = client.chat(
@@ -611,8 +644,11 @@ def _call_once(client: Any, cfg: VisionConfig, image_arg: Any,
                    "images": [image_arg]}],
         format=fmt,
         think=False,                    # 需求要求关思考; 见 VisionConfig.no_think 说明
+        keep_alive=cfg.keep_alive,      # 连续识别时模型常驻, 避免每次重载
         options=opts,
     )
+    finish = str((resp.get("done_reason") if isinstance(resp, dict)
+                  else getattr(resp, "done_reason", "")) or "")
     msg = resp.get("message", {}) if isinstance(resp, dict) else resp.message
     content = msg.get("content") if isinstance(msg, dict) else msg.content
     thinking = (msg.get("thinking") if isinstance(msg, dict)
@@ -620,7 +656,7 @@ def _call_once(client: Any, cfg: VisionConfig, image_arg: Any,
     data, err = parse_ai_json(content)
     if not err and data is None:
         err = "模型没有返回任何内容"
-    return data, err, len(str(thinking))
+    return data, err, len(str(thinking)), finish
 
 
 def _shrink_image(image_path: Any, max_side: int) -> Optional[bytes]:
@@ -699,11 +735,14 @@ def extract_parcel_info(image_path: Any,
     # 因此重试**必须调整真正有用的两个东西**: 上下文长度 与 图片大小。
     # (最初只换 format, 实测三种 format 表现完全一样, 白试。)
     fmt_primary: Any = SCHEMA if cfg.use_schema else "json"
+    # 第二档最多翻到 16384: 再高就会把 8 GB 显存撑爆, 退化成 CPU 混跑,
+    # 越"重试"越慢 (实测 65536 时 9.8 GB, 41% CPU)。
+    ctx_retry = min(int(cfg.num_ctx) * 2, 16384)
     ladder: List[Dict[str, Any]] = [
         {"label": f"schema/ctx{cfg.num_ctx}", "fmt": fmt_primary,
          "num_ctx": cfg.num_ctx, "img": image_arg},
-        {"label": f"json/ctx{cfg.num_ctx * 2}", "fmt": "json",
-         "num_ctx": cfg.num_ctx * 2, "img": image_arg},
+        {"label": f"json/ctx{ctx_retry}", "fmt": "json",
+         "num_ctx": ctx_retry, "img": image_arg},
     ]
     # 第三档: 把图缩到 1200 再试 —— 图小则图像 token 少, 给思考留出更多预算。
     shrunk = _shrink_image(path, 1200)
@@ -716,6 +755,13 @@ def extract_parcel_info(image_path: Any,
 
     last_err = ""
     for step in ladder:
+        # 总预算: 正常 2~4 秒; 病态图不再一档一档耗下去
+        elapsed = time.perf_counter() - t0
+        if (cfg.total_budget_s and elapsed >= float(cfg.total_budget_s)):
+            last_err = last_err or f"总预算 {cfg.total_budget_s:.0f} 秒已用完"
+            _log(log, f"  [AI] 跳过 {step['label']}: 已耗时 {elapsed:.1f}s, "
+                      f"超过总预算 {cfg.total_budget_s:.0f}s")
+            break
         # 每次尝试单独限时: 避免一张特别难的图把整批拖到几分钟
         try:
             client = ollama.Client(host=cfg.host,
@@ -724,7 +770,7 @@ def extract_parcel_info(image_path: Any,
             return _fail(f"创建 Ollama 客户端失败: {type(exc).__name__}: {exc}")
 
         try:
-            data, perr, think_len = _call_once(
+            data, perr, think_len, finish = _call_once(
                 client, cfg, step["img"], step["fmt"], num_ctx=step["num_ctx"])
         except Exception as exc:                 # noqa: BLE001
             last_err = f"{step['label']} 调用失败: {type(exc).__name__}: {exc}"
@@ -736,6 +782,12 @@ def extract_parcel_info(image_path: Any,
             hint = (f" (思考 {think_len} 字, 疑似上下文被吃光)"
                     if think_len > 1500 else "")
             _log(log, f"  [AI] {step['label']} 未成功: {perr}{hint}")
+            if finish == "length":
+                # 撞上 num_predict 上限仍不是完整 JSON: 模型在打转,
+                # 同图重试只会再烧一遍 token, 直接停。
+                _log(log, f"  [AI] 输出达到 {cfg.max_output_tokens} token 上限"
+                          f"仍不完整, 停止重试")
+                break
             continue
 
         # 模型可能返回数组 (提示词里允许多图); 单图取第一个

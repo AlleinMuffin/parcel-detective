@@ -32,7 +32,7 @@ __all__ = [
     "model_registry",
 ]
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 
 def __getattr__(name: str):
